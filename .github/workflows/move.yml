@@ -1,0 +1,21 @@
+name: move-kit
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move kit contents to root
+        run: |
+          tar -C kit --exclude=./.github -cf - . | tar -xf -
+          find kit -mindepth 1 -maxdepth 1 ! -name .github -exec rm -rf {} +
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          git add -A
+          git commit -m "Move kit contents to root [skip ci]" || exit 0
+          git push
