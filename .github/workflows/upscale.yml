@@ -99,6 +99,7 @@ jobs:
           SP=$(python -c "import site;print(site.getsitepackages()[0])")
           sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/' "$SP/basicsr/data/degradations.py"
           git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN.git work_repo
+          echo "__version__ = '0.3.0'" > work_repo/realesrgan/version.py
       - name: Upscale this chunk
         env:
           VIDEO: ${{ needs.plan.outputs.video }}
