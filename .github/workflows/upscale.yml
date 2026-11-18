@@ -1,14 +1,12 @@
-name: Upscale test
+name: Upscale to 4K (parallel)
 
 on:
   workflow_dispatch:
     inputs:
       video:
-        description: "File name inside videos/ (e.g. clip1.mp4)"
-        required: true
-      frames:
-        description: "Frames to process (5 = quick benchmark, 0 = whole video)"
-        default: "5"
+        description: "File name inside videos/ (leave BLANK to use the first video found)"
+        required: false
+        default: ""
       model:
         description: "Real-ESRGAN model"
         default: "RealESRGAN_x4plus"
@@ -17,30 +15,153 @@ on:
           - RealESRGAN_x4plus
           - realesr-general-x4v3
           - RealESRGAN_x4plus_anime_6B
+      max_jobs:
+        description: "Parallel jobs (free plan allows about 20)"
+        default: "20"
+      limit_frames:
+        description: "Only first N frames (0 = whole video). Use 20 for a quick test."
+        default: "0"
 
 jobs:
-  upscale:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    outputs:
+      video: ${{ steps.p.outputs.video }}
+      fps: ${{ steps.p.outputs.fps }}
+      total: ${{ steps.p.outputs.total }}
+      chunk: ${{ steps.p.outputs.chunk }}
+      ids: ${{ steps.p.outputs.ids }}
+      outscale: ${{ steps.p.outputs.outscale }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Find video and plan chunks
+        id: p
+        env:
+          INPUT: ${{ inputs.video }}
+          MAXJOBS: ${{ inputs.max_jobs }}
+          LIMIT: ${{ inputs.limit_frames }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT" ]; then
+            NAME=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1]))' "$INPUT")
+          else
+            NAME=$(ls videos 2>/dev/null | grep -iE '\.(mp4|mov|mkv|webm)$' | head -n1 || true)
+          fi
+          if [ -z "$NAME" ] || [ ! -f "videos/$NAME" ]; then
+            echo "::error::Video not found: '$NAME'. Files that exist in videos/ are listed below:"
+            ls -la videos || echo "(the videos/ folder does not exist in the repo)"
+            exit 1
+          fi
+          IN="videos/$NAME"
+          if ! ffprobe -v error "$IN"; then
+            echo "::error::'$NAME' is damaged or incomplete (bad upload). Re-upload it."
+            exit 1
+          fi
+          FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$IN")
+          W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN")
+          TOTAL=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$IN")
+          if [ "$LIMIT" -gt 0 ] && [ "$LIMIT" -lt "$TOTAL" ]; then TOTAL=$LIMIT; fi
+          CHUNK=$(( (TOTAL + MAXJOBS - 1) / MAXJOBS ))
+          K=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+          IDS=$(python3 -c "import json;print(json.dumps(list(range($K))))")
+          OUTSCALE=$(python3 -c "print(round(3840/$W,4))")
+          echo "Video=$NAME fps=$FPS frames=$TOTAL width=$W -> $K jobs x $CHUNK frames, outscale $OUTSCALE"
+          {
+            echo "video=$NAME"
+            echo "fps=$FPS"
+            echo "total=$TOTAL"
+            echo "chunk=$CHUNK"
+            echo "ids=$IDS"
+            echo "outscale=$OUTSCALE"
+          } >> "$GITHUB_OUTPUT"
 
+  upscale:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.plan.outputs.ids) }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Run upscale
+      - name: Install Real-ESRGAN (CPU)
+        run: |
+          pip install -q "numpy<2" torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -q basicsr realesrgan opencv-python-headless facexlib gfpgan
+          SP=$(python -c "import site;print(site.getsitepackages()[0])")
+          sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/' "$SP/basicsr/data/degradations.py"
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN.git work_repo
+      - name: Upscale this chunk
         env:
-          VIDEO: ${{ inputs.video }}
-          FRAMES: ${{ inputs.frames }}
+          VIDEO: ${{ needs.plan.outputs.video }}
+          FPS: ${{ needs.plan.outputs.fps }}
+          TOTAL: ${{ needs.plan.outputs.total }}
+          CHUNK: ${{ needs.plan.outputs.chunk }}
+          OUTSCALE: ${{ needs.plan.outputs.outscale }}
           MODEL: ${{ inputs.model }}
-        run: bash scripts/run.sh
+          ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          START=$(( ID * CHUNK ))
+          END=$(( START + CHUNK ))
+          if [ "$END" -gt "$TOTAL" ]; then END=$TOTAL; fi
+          END=$(( END - 1 ))
+          echo "Chunk $ID: frames $START to $END"
+          mkdir -p work/in work/out seg
+          ffmpeg -loglevel error -i "videos/$VIDEO" \
+            -vf "select='between(n,$START,$END)'" -fps_mode passthrough -start_number 0 \
+            work/in/f_%05d.png
+          N=$(ls work/in | wc -l)
+          T0=$(date +%s)
+          python work_repo/inference_realesrgan.py -n "$MODEL" -i work/in -o work/out \
+            --outscale "$OUTSCALE" --fp32 --tile 400 --suffix up
+          T1=$(date +%s)
+          SECS=$(( T1 - T0 ))
+          PER=$(python -c "print(round($SECS/$N,2))")
+          ffmpeg -loglevel error -y -framerate "$FPS" -start_number 0 -i work/out/f_%05d_up.png \
+            -vf "scale=3840:-2:flags=lanczos" -c:v libx264 -crf 14 -preset medium -pix_fmt yuv420p \
+            seg/seg.mp4
+          echo "- Chunk $ID: $N frames in ${SECS}s (**$PER s/frame**)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.id }}
+          path: seg/seg.mp4
+          retention-days: 1
 
-      - name: Upload result
-        uses: actions/upload-artifact@v4
+  stitch:
+    needs: [plan, upscale]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seg-*
+          path: segs
+      - name: Join chunks and add audio
+        env:
+          VIDEO: ${{ needs.plan.outputs.video }}
+          IDS: ${{ needs.plan.outputs.ids }}
+        run: |
+          set -euo pipefail
+          K=$(python3 -c "import json,os;print(len(json.loads(os.environ['IDS'])))")
+          : > list.txt
+          for i in $(seq 0 $((K-1))); do echo "file '$PWD/segs/seg-$i/seg.mp4'" >> list.txt; done
+          mkdir -p out
+          ffmpeg -loglevel error -y -f concat -safe 0 -i list.txt -i "videos/$VIDEO" \
+            -map 0:v -map "1:a?" -c:v copy -c:a aac -shortest out/upscaled_4k.mp4
+          ffprobe -v error -show_entries stream=codec_type,width,height,nb_frames -of default=nw=1 out/upscaled_4k.mp4
+      - uses: actions/upload-artifact@v4
         with:
           name: upscaled-4k
-          path: out/*.mp4
+          path: out/upscaled_4k.mp4
+          retention-days: 7
