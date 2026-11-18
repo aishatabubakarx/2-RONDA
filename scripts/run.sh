@@ -11,9 +11,9 @@ echo "== CPU info =="; nproc; lscpu | grep "Model name" || true
 echo "== Install (CPU torch + Real-ESRGAN) =="
 pip install -q "numpy<2" torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -q basicsr realesrgan opencv-python-headless facexlib gfpgan
-# basicsr fix for newer torchvision
-BS=$(python -c "import basicsr,os;print(os.path.dirname(basicsr.__file__))")
-sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/' "$BS/data/degradations.py"
+# basicsr fix for newer torchvision (patch the file WITHOUT importing basicsr)
+SP=$(python -c "import site;print(site.getsitepackages()[0])")
+sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/' "$SP/basicsr/data/degradations.py"
 
 git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN.git work/repo
 
